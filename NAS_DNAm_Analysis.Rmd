@@ -1,7 +1,16 @@
 ---
-title: "NAS_DNAm_Analysis"
+title: "NAS_DNAm_Analysis — preprocessing and epigenetic age"
 output: html_document
 ---
+
+This document performs preprocessing, surrogate-variable estimation, epigenetic
+clock analysis, and phenotype-level mixed modeling. 
+
+Region- and pathway-level analyses are in `NAS_DNAm_Regions_Pathways.Rmd`, which
+runs after `limma_corr.R`.
+
+Exposures are the 30-day moving average of each indicator, scaled by its
+interquartile range.
 
 # Setup
 
@@ -14,7 +23,7 @@ suppressPackageStartupMessages({
 config <- list(
   path_data = "../Data",
   path_out  = "../Output",
-  path_code = "../Scripts",
+  path_code = ".",
   arraytype = "450K",
   norm_method = "BMIQ",
   n_cores = 10,
@@ -31,33 +40,17 @@ path_code <- config$path_code
 
 source(file.path(path_code, "helper.R"))
 
-# Inputs
-beta_raw <- readRDS(file.path(path_data, "beta2_impu_cleaning(original version 2_probe cleaning_imputation).Rds"))
+beta_raw <- readRDS(file.path(path_data, "beta2_impu_cleaning_champnorm.RDS"))
 pheno    <- readRDS(file.path(path_data, "pheno_methy.RDS"))
 
-stopifnot(is.matrix(beta_raw) || is.data.frame(beta_raw))
-stopifnot(is.data.frame(pheno))
-stopifnot("samplename_450k" %in% names(pheno))
+stopifnot(is.data.frame(pheno), "samplename_450k" %in% names(pheno))
 ```
 
 # Data processing
 
-## Exposure scaling (IQR units)
+## Normalization and M-values
 
-```{r}
-expo_names <- c(
-  "CRII.mov365","ntr.mov365","PLB.mov365",
-  "SSN.mov365","IMF.mov365","Kp_index.mov365"
-)
-
-for (e in expo_names) {
-  q75 <- quantile(pheno[[e]], 0.75, na.rm = TRUE)
-  q25 <- quantile(pheno[[e]], 0.25, na.rm = TRUE)
-  pheno[[paste0(e, "_IQR")]] <- (pheno[[e]] - q25) / (q75 - q25)
-}
-```
-
-## DNAm normalization and M-value conversion
+Beta values are normalized using BMIQ in ChAMP and logit-transformed to M-values.
 
 ```{r}
 suppressPackageStartupMessages(library(ChAMP))
@@ -69,28 +62,25 @@ beta_norm <- champ.norm(
   plotBMIQ  = TRUE,
   cores     = config$n_cores
 )
-
 saveRDS(beta_norm, file.path(path_data, "beta_norm_champ.RDS"))
 
-# Convert beta (0–1) to M-values with clipping
-epsilon <- 1e-6
+epsilon   <- 1e-6
 beta_clip <- pmin(pmax(beta_norm, epsilon), 1 - epsilon)
 dnam_mval <- log2(beta_clip / (1 - beta_clip))
 
-# Keep only matched samples between phenotype and DNAm matrix
 common_samples <- intersect(pheno$samplename_450k, colnames(dnam_mval))
-pheno <- pheno[match(common_samples, pheno$samplename_450k), , drop = FALSE]
+pheno     <- pheno[match(common_samples, pheno$samplename_450k), , drop = FALSE]
 dnam_mval <- dnam_mval[, match(common_samples, colnames(dnam_mval)), drop = FALSE]
-
 stopifnot(identical(pheno$samplename_450k, colnames(dnam_mval)))
 
-message("M-value matrix: ", nrow(dnam_mval), " probes × ", ncol(dnam_mval), " samples")
-message("NA count: ", sum(is.na(dnam_mval)))
-message("NaN count: ", sum(is.nan(dnam_mval)))
-message("Inf count: ", sum(is.infinite(dnam_mval)))
+message(nrow(dnam_mval), " probes × ", ncol(dnam_mval), " samples, ",
+        length(unique(pheno$ID)), " participants")
 ```
 
-## Surrogate variable estimation (SmartSVA)
+## Surrogate variables (SmartSVA)
+
+Eight SVs are estimated with the design matrix below; `num.sv` is reported for
+comparison. 
 
 ```{r}
 suppressPackageStartupMessages({
@@ -98,15 +88,11 @@ suppressPackageStartupMessages({
   library(SmartSVA)
 })
 
-pheno <- pheno %>%
-  mutate(
-    batch = sub("_.*$", "", samplename_450k)
-  )
+pheno <- pheno %>% mutate(batch = sub("_.*$", "", samplename_450k))
 rownames(pheno) <- pheno$samplename_450k
 
-# Subset to most variable probes for SV estimation
 idx_top <- order(rowVars(dnam_mval), decreasing = TRUE)[seq_len(config$top_var_probes)]
-Msub <- dnam_mval[idx_top, , drop = FALSE]
+Msub    <- dnam_mval[idx_top, , drop = FALSE]
 
 mod <- model.matrix(
   ~ CRII.mov365 + ntr.mov365 + PLB.mov365 + SSN.mov365 + IMF.mov365 + Kp_index.mov365 +
@@ -114,28 +100,23 @@ mod <- model.matrix(
     CD8T_est450k + CD4T_est450k + NK_est450k + Bcell_est450k + Mono_est450k + Gran_est450k,
   data = pheno
 )
-
 mod0 <- model.matrix(
   ~ AGE + SMK + packyrs + bmi + educmax + temp_c + VISIB + year + season +
     CD8T_est450k + CD4T_est450k + NK_est450k + Bcell_est450k + Mono_est450k + Gran_est450k,
   data = pheno
 )
 
-# Optional: estimate n.sv empirically (kept for reference in logs)
-n_suggested <- num.sv(Msub, mod, method = "be", B = 25)
-message("Suggested n.sv (be, B=25): ", n_suggested)
+message("Suggested n.sv (be, B=25): ", num.sv(Msub, mod, method = "be", B = 25))
 
 svobj <- smartsva.cpp(dat = dnam_mval, mod = mod, mod0 = mod0, n.sv = config$n_sv)
 saveRDS(svobj, file.path(path_data, sprintf("sva_sv%d.RDS", config$n_sv)))
 
-# Replace any existing sv columns and append new ones
 sv_cols <- paste0("sv", seq_len(config$n_sv))
 pheno <- pheno %>%
-  select(-any_of(paste0("sv", 1:20))) %>%  
+  select(-any_of(paste0("sv", 1:20))) %>%
   bind_cols(as.data.frame(svobj$sv))
 colnames(pheno)[(ncol(pheno) - config$n_sv + 1):ncol(pheno)] <- sv_cols
 
-saveRDS(pheno, file.path(path_data, "pheno_methy_with_sv.RDS"))
 saveRDS(dnam_mval, file.path(path_data, "dnam_mval.RDS"))
 ```
 
@@ -155,177 +136,112 @@ anno_df <- tibble(
   gene   = as.character(anno$UCSC_RefGene_Name),
   island = as.character(anno$Relation_to_Island)
 )
-
 saveRDS(anno_df, file.path(path_data, "anno_df.RDS"))
 ```
 
-## DNAm clocks (age acceleration residuals)
+## Epigenetic clocks
+
+Clock values are obtained from the Clock Foundation calculator 
+(https://dnamage.clockfoundation.org). EAA is calculated as the
+residual from regressing each clock on chronological age, cell fractions, and
+the eight SVs.
 
 ```{r}
-DNAmAge <- readr::read_csv("DNAmAgeCalcProject_19645_Results.csv", show_col_types = FALSE)
+DNAmAge <- readr::read_csv(
+  file.path(path_data, "DNAmAgeCalcProject_19645_Results.csv"),
+  show_col_types = FALSE
+)
 
 old_names  <- c("DNAmAge", "DNAmAgeHannum", "DNAmPhenoAge", "DNAmGrimAge2BasedOnRealAge")
 dnam_clock <- c("HorvathAge", "HannumAge", "PhenoAge", "GrimAge")
 names(DNAmAge)[match(old_names, names(DNAmAge))] <- dnam_clock
 
-# Harmonize sample ID field from calculator output
-DNAmAge <- DNAmAge %>%
-  mutate(
-    samplename_450k = gsub("S", "", SID)
-  )
+DNAmAge <- DNAmAge %>% mutate(samplename_450k = gsub("S", "", SID))
 
-sv_terms <- paste0("sv", seq_len(config$n_sv))
-adj_terms <- c("Age", "CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran", sv_terms)
-
+adj_terms <- c("Age", "CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran", sv_cols)
 for (clk in dnam_clock) {
   fml <- as.formula(paste(clk, "~", paste(adj_terms, collapse = "+")))
   DNAmAge[[paste0(clk, "_acc")]] <- residuals(lm(fml, data = DNAmAge))
 }
-
 dnam_acc <- paste0(dnam_clock, "_acc")
 
-# Merge clock outputs onto phenotype table (if samplename_450k matches)
 pheno <- pheno %>%
   left_join(
-    DNAmAge %>% select(samplename_450k, any_of(c(dnam_clock, dnam_acc, "CD8T","CD4T","NK","Bcell","Mono","Gran"))),
+    DNAmAge %>% select(samplename_450k,
+                       any_of(c(dnam_clock, dnam_acc,
+                                "CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran"))),
     by = "samplename_450k"
   )
-
-# Also compute accelerations directly within pheno using clinical AGE (optional)
-adj_terms_pheno <- c("AGE", "CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran", sv_terms)
-for (clk in dnam_clock) {
-  if (!clk %in% names(pheno)) next
-  fml <- as.formula(paste(clk, "~", paste(adj_terms_pheno, collapse = "+")))
-  pheno[[paste0(clk, "_acc_pheno")]] <- residuals(lm(fml, data = pheno))
-}
 ```
 
-# Phenotype-based analyses
+## Exposure scaling
+
+`run_lmer_loop_iqr()` scales internally; the `_IQR` columns written here are for
+the EWAS design in `limma_corr.R`.
 
 ```{r}
-pheno_df <- pheno
+indicators <- c("CRII", "ntr", "SSN", "IMF", "Kp_index")
+exposures  <- paste0(indicators, ".mov30")
 
-vars_to_scale <- c("CRII.mov30", "ntr.mov30", "SSN.mov30", "IMF.mov30", "Kp_index.mov30", "PLB.mov30")
-pheno_df <- pheno_df %>%
-  mutate(
-    across(all_of(vars_to_scale), ~ . / IQR(., na.rm = TRUE), .names = "{.col}_IQR")
-  )
+pheno_df <- pheno %>%
+  mutate(across(all_of(exposures), ~ . / IQR(., na.rm = TRUE), .names = "{.col}_IQR"))
 
 saveRDS(pheno_df, file.path(path_data, "pheno_methy_Aug2025.RDS"))
 ```
 
-## Descriptive statistics
+# Phenotype-based analyses
+
+## Table 1
 
 ```{r}
 suppressPackageStartupMessages(library(tableone))
 
-pheno_df <- pheno_df %>%
-  arrange(ID, date) %>%
-  group_by(ID) %>%
-  mutate(visit_number = row_number()) %>%
-  ungroup()
+baseline <- pheno_df %>%
+  arrange(ID, date) %>% group_by(ID) %>% slice(1) %>% ungroup()
 
-table(pheno_df$visit_number)
-
-vars <- c("AGE","bmi","packyrs","educmax","SMK","diabete","Statin_flag","med","WBC","NEUT","LYMPH")
+vars     <- c("AGE","bmi","packyrs","educmax","SMK","diabete","Statin_flag","med","WBC","NEUT","LYMPH")
 cat_vars <- c("SMK","diabete","Statin_flag","med")
-table1 <- CreateTableOne(vars = vars, data = pheno_df %>% filter(visit_number == 1), factorVars = cat_vars)
-print(table1, nonnormal = c("packyrs"))
+print(CreateTableOne(vars = vars, data = baseline, factorVars = cat_vars),
+      nonnormal = "packyrs")
 ```
 
-## Regression 
+## Exposure IQRs by averaging window
 
 ```{r}
-## Function to run lmer models in a loop 
-library(lmerTest)
-library(broom.mixed)
-library(dplyr)
-
-run_lmer_loop_iqr <- function(data, outcomes, exposures, covariates, random_effect = "ID") {
-  results <- list()
-  
-  for (x in exposures) {
-    iqr_val <- IQR(data[[x]], na.rm = TRUE)
-    if (iqr_val == 0 || is.na(iqr_val)) next
-    
-    scaled_var <- paste0(x, "_scaled")
-    data[[scaled_var]] <- data[[x]] / iqr_val
-    
-    for (y in outcomes) {
-      rhs <- paste(c(scaled_var, covariates), collapse = " + ")
-      formula_str <- paste0(y, " ~ ", rhs, " + (1 | ", random_effect, ")")
-      formula <- as.formula(formula_str)
-      
-      mod <- tryCatch(
-        lmer(formula, data = data, REML = FALSE),
-        error = function(e) return(NULL)
-      )
-      
-      if (!is.null(mod)) {
-        tidy_mod <- broom.mixed::tidy(mod, effects = "fixed", conf.int = TRUE) %>%
-          filter(term == scaled_var) %>%
-          mutate(
-            outcome = y,
-            exposure = x,
-            iqr = iqr_val,
-            star = case_when(
-              p.value < 0.001 ~ "***",
-              p.value < 0.01  ~ "**",
-              p.value < 0.05  ~ "*",
-              p.value < 0.1   ~ ".",
-              TRUE            ~ ""
-            )
-          ) %>%
-          dplyr::select(outcome, exposure, iqr, estimate, std.error, conf.low, conf.high, p.value, star)
-        
-        results[[paste0(y, "_", x)]] <- tidy_mod
-      }
-    }
-  }
-  
-  final_df <- bind_rows(results)
-  return(final_df)
-}
+sapply(c(daily = "", `7-day` = ".mov7", `30-day` = ".mov30"), function(sfx) {
+  sapply(indicators, function(ind) IQR(pheno_df[[paste0(ind, sfx)]], na.rm = TRUE))
+}) %>% round(2)
 ```
+
+## Mixed models
+
+Three sequential covariate sets. Model 3 adds temperature, visibility and season.
 
 ```{r}
-exposures <- c("CRII", "ntr", "SSN", "IMF", "Kp_index")
-outcomes  <- dnam_acc
+outcomes   <- dnam_acc
+cell_terms <- sprintf("scale(%s)", c("CD8T","CD4T","NK","Bcell","Mono","Gran"))
 
-sv_cols <- paste0("sv", seq_len(config$n_sv))
+cov_mod1 <- c("AGE", "year", cell_terms, sv_cols)
+cov_mod2 <- c(cov_mod1, "bmi", "as.factor(SMK)", "packyrs", "educmax",
+              "Statin_flag", "med", "diabete")
+cov_mod3 <- c(cov_mod2, "temp_c.mov30", "VISIB.mov30", "season")
 
-cov_mod3 <- c(
-  "AGE","year","bmi","as.factor(SMK)","packyrs","educmax","Statin_flag","med","diabete",
-  "temp_c","VISIB","season",
-  "scale(CD8T)","scale(CD4T)","scale(NK)","scale(Bcell)","scale(Mono)","scale(Gran)",
-  sv_cols
+forest_df <- bind_rows(
+  run_lmer_loop_iqr(pheno_df, outcomes, exposures, cov_mod1) %>% mutate(model = "mod1"),
+  run_lmer_loop_iqr(pheno_df, outcomes, exposures, cov_mod2) %>% mutate(model = "mod2"),
+  run_lmer_loop_iqr(pheno_df, outcomes, exposures, cov_mod3) %>% mutate(model = "mod3")
 )
+write.csv(forest_df, file.path(path_out, "forest_mov30_age.csv"), row.names = FALSE)
 
-cov_mod2 <- c(
-  "AGE","year","bmi","as.factor(SMK)","packyrs","educmax","Statin_flag","med","diabete",
-  "scale(CD8T)","scale(CD4T)","scale(NK)","scale(Bcell)","scale(Mono)","scale(Gran)",
-  sv_cols
-)
-
-cov_mod1 <- c(
-  "AGE","year",
-  "scale(CD8T)","scale(CD4T)","scale(NK)","scale(Bcell)","scale(Mono)","scale(Gran)",
-  sv_cols
-)
-
-mod3 <- run_lmer_loop_iqr(data = pheno_df, outcomes = outcomes, exposures = exposures, covariates = cov_mod3) %>% mutate(model = "mod3")
-mod2 <- run_lmer_loop_iqr(data = pheno_df, outcomes = outcomes, exposures = exposures, covariates = cov_mod2) %>% mutate(model = "mod2")
-mod1 <- run_lmer_loop_iqr(data = pheno_df, outcomes = outcomes, exposures = exposures, covariates = cov_mod1) %>% mutate(model = "mod1")
-
-forest_df <- bind_rows(mod1, mod2, mod3)
+forest_df %>% filter(model == "mod3", outcome == "HorvathAge_acc")
 ```
 
-## Forest plot
+## Fig. 1b
 
 ```{r}
 suppressPackageStartupMessages(library(grid))
 
-forest_df <- forest_df %>%
+plot_df <- forest_df %>%
   mutate(
     exposure = gsub("\\.mov\\d+$", "", exposure),
     exposure = factor(exposure, levels = rev(unique(exposure))),
@@ -333,241 +249,16 @@ forest_df <- forest_df %>%
     outcome  = factor(outcome, levels = outcomes)
   )
 
-dodge_width <- 0.6
-p <- ggplot(forest_df, aes(x = exposure, y = estimate, ymin = conf.low, ymax = conf.high, color = model)) +
-  geom_errorbar(position = position_dodge(width = dodge_width), width = 0.2, linewidth = 0.6) +
-  geom_point(position = position_dodge(width = dodge_width), size = 2.2) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.6) +
+p <- ggplot(plot_df, aes(exposure, estimate, ymin = conf.low, ymax = conf.high, color = model)) +
+  geom_errorbar(position = position_dodge(width = 0.6), width = 0.2, linewidth = 0.6) +
+  geom_point(position = position_dodge(width = 0.6), size = 2.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.6) +
   coord_flip() +
   facet_wrap(~ outcome, ncol = length(outcomes)) +
-  scale_color_manual(values = c("mod1" = "#78B7D0", "mod2" = "#227B94", "mod3" = "#16325B")) +
+  scale_color_manual(values = c(mod1 = "#78B7D0", mod2 = "#227B94", mod3 = "#16325B")) +
   labs(x = NULL, y = "EAA (95% CI)", color = "Model") +
   plot.format +
-  theme(panel.spacing = unit(1, "lines"), strip.text = element_text(face = "bold"), legend.position = "none")
+  theme(panel.spacing = unit(1, "lines"), legend.position = "none")
 
-ggsave(p, filename = file.path(path_out, "forest_daily_age_kp.svg"), width = 7.5, height = 2.75)
-```
-
-# DNAm analyses
-
-## EWAS results post-processing
-
-```{r}
-anno_df <- readRDS(file.path(path_data, "anno_df.RDS"))
-
-annotate_ewas <- function(df, anno_df) {
-  df %>%
-    mutate(se = beta / t) %>%
-    left_join(anno_df, by = c("CpG" = "CpG"))
-}
-
-# Load EWAS objects (run in background)
-ewas_list <- list(
-  CRII    = EWAS_CRII_results,
-  ntr     = EWAS_ntr_results,
-  SSN     = EWAS_SSN_results,
-  IMF     = EWAS_IMF_results,
-  Kp      = EWAS_Kp_results
-)
-
-ewas_list <- imap(ewas_list, ~ annotate_ewas(.x, anno_df))
-
-# Save annotated results
-iwalk(ewas_list, ~ write.csv(.x, file.path(path_out, paste0("EWAS_", .y, "_results.csv")), row.names = FALSE))
-
-# Inflation factors (t statistics)
-suppressPackageStartupMessages(library(bacon))
-iwalk(ewas_list, ~ message(.y, " inflation: ", inflation(bacon(.x$t))))
-```
-
-## CpG overlap (Venn) and QQ plots
-
-```{r}
-suppressPackageStartupMessages({
-  library(ggvenn)
-})
-
-venn_data <- list(
-  CRII     = ewas_list$CRII %>% filter(q_bh < 0.05) %>% pull(CpG),
-  Neutrons = ewas_list$ntr  %>% filter(q_bh < 0.05) %>% pull(CpG)
-)
-
-p <- ggvenn(venn_data, fill_color = c("#9b5de5", "#f15bb5"), stroke_size = 0.5, set_name_size = 4) +
-  labs(title = "Significant CpGs: CRII vs Neutrons", x = NULL, y = NULL) +
-  plot.format +
-  theme(axis.text = element_blank(), axis.ticks = element_blank(), panel.border = element_blank())
-
-ggsave(p, filename = file.path(path_out, "venn_CRII_ntr.svg"), width = 6, height = 4)
-```
-
-## DMR analysis (comb-p) + Manhattan highlighting DMR hits 
-
-```{r}
-suppressPackageStartupMessages({
-  library(ENmix)
-  library(gtools)
-  library(data.table)
-  library(ggrepel)
-})
-
-dat_imf <- ewas_list$IMF %>%
-  transmute(probe = CpG, p = p_bacon, chr = chr, start = pos, end = pos)
-
-# Run combp 
-# dmr_imf <- combp(dat_imf, dist.cutoff = 1000, seed = 0.01, nCores = config$n_cores)
-
-dmr_imf <- readr::read_csv("combp-imf/resu_combp.csv", show_col_types = FALSE) %>%
-  filter(fdr < 0.05, nprobe > 2) %>%
-  mutate(chr = gsub("^chr", "", chr))
-
-gene_labels <- ewas_list$IMF %>%
-  mutate(gene_clean = if_else(
-    is.na(gene) | gene == "",
-    CpG,
-    str_split(gene, ";") |> map_chr(~ unique(.x[.x != ""])[1])
-  )) %>%
-  select(CpG, gene_clean)
-
-dat2 <- dat_imf %>%
-  left_join(gene_labels, by = c("probe" = "CpG")) %>%
-  mutate(chr = gsub("^chr", "", chr)) %>%
-  mutate(chr = factor(chr, levels = mixedsort(unique(chr)))) %>%
-  arrange(chr, start) %>%
-  group_by(chr) %>%
-  mutate(chr_len = max(start, na.rm = TRUE)) %>%
-  ungroup() %>%
-  mutate(
-    bp_cum = start + cumsum(as.numeric(chr_len)) - as.numeric(chr_len),
-    logp = -log10(p),
-    color_group = as.numeric(chr) %% 2
-  ) %>%
-  as.data.table()
-
-setDT(dmr_imf)
-dmr_imf[, `:=`(start = as.numeric(start), end = as.numeric(end))]
-setkey(dat2, chr, start, end)
-setkey(dmr_imf, chr, start, end)
-
-hits_idx <- foverlaps(dat2, dmr_imf, nomatch = 0L, which = TRUE)$xid
-dat2[, is_sig := FALSE]
-dat2[hits_idx, is_sig := TRUE]
-
-top_hits <- dat2[is_sig == TRUE][order(p)][1:min(10, .N)]
-dat2[, is_top := probe %in% top_hits$probe]
-
-axis_df <- dat2[, .(center = mean(range(bp_cum))), by = chr] %>%
-  mutate(chr_num = suppressWarnings(as.numeric(as.character(chr))),
-         label   = if_else(!is.na(chr_num) & chr_num > 16 & chr_num %% 2 == 0, "", as.character(chr_num)))
-
-plot_df <- as_tibble(dat2)
-
-p <- ggplot() +
-  geom_point(data = filter(plot_df, !is_sig), aes(bp_cum, logp, colour = factor(color_group)), size = 0.6, alpha = 0.6) +
-  geom_point(data = filter(plot_df, is_sig & !is_top), aes(bp_cum, logp), colour = "#E6521F", size = 0.8, alpha = 0.8) +
-  geom_point(data = filter(plot_df, is_top), aes(bp_cum, logp), colour = "#EA2F14", shape = 17, size = 2) +
-  geom_text_repel(data = as_tibble(top_hits), aes(bp_cum, logp, label = gene_clean), size = 3, max.overlaps = 1e3) +
-  geom_hline(yintercept = -log10(1e-6), linetype = "dashed") +
-  scale_colour_manual(values = c("0" = "#2C7BB6", "1" = "#A6CEE3")) +
-  scale_x_continuous(breaks = axis_df$center, labels = axis_df$label, expand = c(0.01, 0)) +
-  labs(x = "Chromosome", y = expression(-log[10](p)), title = "IMF (DMR-highlighted Manhattan)") +
-  plot.format +
-  theme(legend.position = "none")
-
-ggsave(p, filename = file.path(path_out, "manhattan_imf.png"), width = 8, height = 4)
-```
-
-# Global methylation summaries (beta scale)
-
-```{r}
-beta_norm <- readRDS(file.path(path_data, "beta_norm_champ.RDS"))
-anno_df   <- readRDS(file.path(path_data, "anno_df.RDS"))
-
-anno <- anno_df
-rownames(anno) <- anno$CpG
-anno <- anno[match(rownames(beta_norm), rownames(anno)), , drop = FALSE]
-
-keep_auto <- !is.na(anno$chr) & anno$chr %in% paste0("chr", 1:22)
-beta_auto <- beta_norm[keep_auto, , drop = FALSE]
-anno_auto <- anno[keep_auto, , drop = FALSE]
-
-common <- intersect(colnames(beta_auto), rownames(pheno))
-beta_auto <- beta_auto[, common, drop = FALSE]
-pheno_g <- pheno[common, , drop = FALSE]
-rownames(pheno_g) <- pheno_g$samplename_450k
-
-suppressPackageStartupMessages(library(limma))
-
-sv_cols <- paste0("sv", seq_len(config$n_sv))
-covar_cols <- c("CD8T","CD4T","NK","Bcell","Mono","Gran", sv_cols)
-covar_cols <- intersect(covar_cols, colnames(pheno_g))
-
-beta_adj <- removeBatchEffect(beta_auto, covariates = as.matrix(pheno_g[, covar_cols, drop = FALSE]))
-
-entropy_beta <- function(M) {
-  M <- pmax(pmin(M, 1 - 1e-6), 1e-6)
-  -(M * log(M) + (1 - M) * log(1 - M)) / log(2)
-}
-
-summarize_global <- function(B, anno, block_n = 50000) {
-  labs <- c("All","Island","OpenSea","N_Shore","S_Shore","N_Shelf","S_Shelf")
-  idxs <- list(
-    All      = rep(TRUE, nrow(anno)),
-    Island   = anno$island == "Island",
-    OpenSea  = anno$island == "OpenSea",
-    N_Shore  = anno$island == "N_Shore",
-    S_Shore  = anno$island == "S_Shore",
-    N_Shelf  = anno$island == "N_Shelf",
-    S_Shelf  = anno$island == "S_Shelf"
-  )
-
-  out <- list()
-  for (nm in labs) {
-    sel <- which(idxs[[nm]] & !is.na(idxs[[nm]]))
-    if (!length(sel)) next
-
-    nS <- ncol(B)
-    sum_beta <- numeric(nS)
-    sum_entropy <- numeric(nS)
-    sum_sq <- numeric(nS)
-    n_nonNA <- numeric(nS)
-
-    for (st in seq(1, length(sel), by = block_n)) {
-      ii <- sel[st:min(st + block_n - 1, length(sel))]
-      X <- B[ii, , drop = FALSE]
-      notNA <- !is.na(X)
-      n_nonNA <- n_nonNA + colSums(notNA)
-
-      X0 <- X; X0[!notNA] <- 0
-      sum_beta <- sum_beta + colSums(X0)
-      sum_sq   <- sum_sq + colSums(X0 * X0)
-
-      E <- entropy_beta(X)
-      E[!notNA] <- 0
-      sum_entropy <- sum_entropy + colSums(E)
-    }
-
-    mml <- sum_beta / n_nonNA
-    sdB <- sqrt(pmax(0, (sum_sq / n_nonNA) - mml^2))
-    nme <- sum_entropy / n_nonNA
-
-    out[[nm]] <- tibble(sample = colnames(B), context = nm, MML = mml, NME = nme, SD_beta = sdB)
-  }
-
-  bind_rows(out)
-}
-
-global_df <- summarize_global(beta_adj, anno_auto)
-
-global_wide <- global_df %>%
-  pivot_wider(
-    id_cols = sample,
-    names_from = context,
-    values_from = c(MML, NME, SD_beta),
-    names_sep = "_"
-  )
-
-pheno <- pheno %>%
-  left_join(global_wide, by = c("samplename_450k" = "sample"))
-
-saveRDS(pheno, file.path(path_data, "pheno_methy_Aug2025_with_global.RDS"))
+ggsave(p, filename = file.path(path_out, "forest_mov30_age.svg"), width = 7.5, height = 2.75)
 ```

@@ -1,0 +1,28 @@
+# Data and derived objects
+Data/
+Intermediate/
+Output/
+*.RDS
+*.Rds
+*.rds
+*.RData
+*.rda
+*.sas7bdat
+*.csv
+*.tsv
+
+# Manuscript and correspondence artifacts
+*.docx
+*.xlsx
+*.pptx
+*.pdf
+
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+.Ruserdata
+
+# Operating system files
+.DS_Store

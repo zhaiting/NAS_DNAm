@@ -1,0 +1,258 @@
+---
+title: "NAS_DNAm_Regions_Pathways"
+output: html_document
+---
+
+This document evaluates CpG overlap and direction of change, generates
+DMR-highlighted Manhattan plots, and performs Hallmark pathway enrichment. It
+produces Fig. 1c, Fig. 1d, Fig. 2, and Fig. 5.
+
+Run after `NAS_DNAm_Analysis.Rmd` and `limma_corr.R`.
+
+Significant regions are read from Supplementary Data S8–S11 of the article.
+Download the Supplementary Data workbook and set `supp_file` below.
+
+# Setup
+
+```{r message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(gtools)
+  library(ggrepel)
+  library(readxl)
+})
+
+path_data <- "../Data"
+path_out  <- "../Output"
+
+supp_file <- file.path(path_data, "NAS_GCR_DNAm_Supp_Data.xlsx")
+
+source("helper.R")
+
+anno_df <- readRDS(file.path(path_data, "anno_df.RDS"))
+
+exp_tags   <- c(CRII = "CRII", Neutrons = "ntr", SSN = "SSN", IMF = "IMF")
+supp_sheet <- c(CRII = "DataS8", Neutrons = "DataS9", SSN = "DataS10", IMF = "DataS11")
+
+ewas <- map(exp_tags, ~ readRDS(file.path(path_out,
+              sprintf("EWAS_%s_mov30_results_limma.rds", .x))) %>%
+              left_join(anno_df, by = "CpG"))
+
+sig <- map(ewas, ~ filter(.x, q_bh < 0.05))
+map_int(sig, nrow)
+```
+
+# CpG overlap across indicators
+
+```{r}
+sig_sets <- map(sig, "CpG")
+
+overlap_tab <- imap_dfr(sig_sets, function(cpgs, nm) {
+  others <- unlist(sig_sets[setdiff(names(sig_sets), nm)], use.names = FALSE)
+  tibble(exposure = nm, n_sig = length(cpgs),
+         n_unique = sum(!cpgs %in% others),
+         pct_unique = round(100 * mean(!cpgs %in% others), 1))
+})
+write.csv(overlap_tab, file.path(path_out, "Fig1c_cpg_uniqueness.csv"), row.names = FALSE)
+
+overlap_tab
+```
+
+```{r}
+suppressPackageStartupMessages(library(ggvenn))
+
+p <- ggvenn(sig_sets, fill_color = c("#9b5de5", "#f15bb5", "#00bbf9", "#fee440"),
+            stroke_size = 0.5, set_name_size = 4, show_percentage = FALSE) +
+  plot.format +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(),
+        panel.border = element_blank())
+
+ggsave(p, filename = file.path(path_out, "Fig1c_cpg_overlap.svg"), width = 6, height = 5)
+```
+
+# direction of methylation change
+
+```{r}
+direction_tab <- imap_dfr(sig, ~ tibble(
+  exposure   = .y,
+  n_sig      = nrow(.x),
+  n_higher   = sum(.x$beta > 0),
+  n_lower    = sum(.x$beta < 0),
+  pct_higher = round(100 * mean(.x$beta > 0), 1)
+))
+write.csv(direction_tab, file.path(path_out, "Fig1d_direction.csv"), row.names = FALSE)
+
+direction_tab
+```
+
+```{r}
+p <- direction_tab %>%
+  select(exposure, n_higher, n_lower) %>%
+  pivot_longer(-exposure, names_to = "direction", values_to = "n") %>%
+  mutate(direction = recode(direction, n_higher = "Higher methylation",
+                                       n_lower  = "Lower methylation")) %>%
+  ggplot(aes(exposure, n, fill = direction)) +
+  geom_col(position = "fill", width = 0.7) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Higher methylation" = "#C1121F",
+                               "Lower methylation"  = "#2C7BB6")) +
+  labs(x = NULL, y = "Proportion of significant CpGs", fill = NULL) +
+  plot.format
+
+ggsave(p, filename = file.path(path_out, "Fig1d_direction.svg"), width = 5, height = 3.5)
+```
+
+# DMR-highlighted Manhattan
+
+Each worksheet contains a title row above the column header (`skip = 1`). Region
+p values and FDR values are imported as text and converted to numeric values.
+
+```{r}
+read_supp_dmr <- function(sheet) {
+  read_excel(supp_file, sheet = sheet, skip = 1) %>%
+    mutate(across(c(start, end, nprobe), as.numeric),
+           across(c(p, fdr), as.numeric),
+           chr = gsub("^chr", "", chr)) %>%
+    filter(!is.na(start), !is.na(end))
+}
+
+dmr <- map(supp_sheet, read_supp_dmr)
+
+map_int(dmr, nrow)
+```
+
+```{r}
+manhattan_dmr <- function(ewas_i, dmr_i, label) {
+  gene_labels <- ewas_i %>%
+    mutate(gene_clean = if_else(
+      is.na(gene) | gene == "", CpG,
+      str_split(gene, ";") |> map_chr(~ unique(.x[.x != ""])[1])
+    )) %>%
+    select(CpG, gene_clean)
+
+  dat <- ewas_i %>%
+    filter(!is.na(chr), !is.na(pos), !is.na(p_bacon)) %>%
+    transmute(probe = CpG, p = p_bacon, chr = gsub("^chr", "", chr),
+              start = pos, end = pos) %>%
+    left_join(gene_labels, by = c("probe" = "CpG")) %>%
+    mutate(chr = factor(chr, levels = mixedsort(unique(chr)))) %>%
+    arrange(chr, start) %>%
+    group_by(chr) %>% mutate(chr_len = max(start, na.rm = TRUE)) %>% ungroup() %>%
+    mutate(
+      bp_cum      = start + cumsum(as.numeric(chr_len)) - as.numeric(chr_len),
+      logp        = -log10(p),
+      color_group = as.numeric(chr) %% 2
+    ) %>%
+    as.data.table()
+
+  reg <- as.data.table(dmr_i)
+  # foverlaps requires matching data types for the join columns
+  reg[, chr := factor(as.character(chr), levels = levels(dat$chr))]
+  setkey(dat, chr, start, end)
+  setkey(reg, chr, start, end)
+
+  hits <- foverlaps(dat, reg, nomatch = 0L, which = TRUE)$xid
+  dat[, is_sig := FALSE]
+  if (length(hits)) dat[hits, is_sig := TRUE]
+
+  top <- dat[is_sig == TRUE][order(p)]
+  top <- top[seq_len(min(10, nrow(top)))]
+  dat[, is_top := probe %in% top$probe]
+
+  axis_df <- dat[, .(center = mean(range(bp_cum))), by = chr] %>%
+    mutate(chr_num = suppressWarnings(as.numeric(as.character(chr))),
+           lab     = if_else(!is.na(chr_num) & chr_num > 16 & chr_num %% 2 == 0,
+                             "", as.character(chr_num)))
+
+  pd <- as_tibble(dat)
+  p <- ggplot() +
+    geom_point(data = filter(pd, !is_sig),
+               aes(bp_cum, logp, colour = factor(color_group)), size = 0.6, alpha = 0.6) +
+    geom_point(data = filter(pd, is_sig & !is_top),
+               aes(bp_cum, logp), colour = "#E6521F", size = 0.8, alpha = 0.8) +
+    geom_point(data = filter(pd, is_top),
+               aes(bp_cum, logp), colour = "#EA2F14", shape = 17, size = 2) +
+    geom_text_repel(data = as_tibble(top),
+                    aes(bp_cum, logp, label = gene_clean), size = 3, max.overlaps = 1e3) +
+    geom_hline(yintercept = -log10(1e-6), linetype = "dashed") +
+    scale_colour_manual(values = c("0" = "#2C7BB6", "1" = "#A6CEE3")) +
+    scale_x_continuous(breaks = axis_df$center, labels = axis_df$lab, expand = c(0.01, 0)) +
+    labs(x = "Chromosome", y = expression(-log[10](p)), title = label) +
+    plot.format +
+    theme(legend.position = "none")
+
+  ggsave(p, filename = file.path(path_out, sprintf("manhattan_%s.png", tolower(label))),
+         width = 8, height = 4)
+}
+
+iwalk(exp_tags, ~ manhattan_dmr(ewas[[.y]], dmr[[.y]], .y))
+```
+
+# Hallmark pathway enrichment
+
+`methylRRA` uses the bacon- and BH-corrected FDR for every tested CpG and
+accounts for CpG-to-gene mapping multiplicity and probe-count bias. The analysis
+is restricted to 14 prespecified genome integrity-related Hallmark sets.
+
+```{r}
+suppressPackageStartupMessages({
+  library(methylGSA)
+  library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+})
+
+hallmark <- readRDS(url("http://bioinf.wehi.edu.au/MSigDB/v7.1/Hs.h.all.v7.1.entrez.rds"))
+
+hall_subset <- c(
+  "HALLMARK_DNA_REPAIR", "HALLMARK_REACTIVE_OXYGEN_SPECIES_PATHWAY", "HALLMARK_P53_PATHWAY",
+  "HALLMARK_OXIDATIVE_PHOSPHORYLATION", "HALLMARK_PEROXISOME",
+  "HALLMARK_MTORC1_SIGNALING", "HALLMARK_PI3K_AKT_MTOR_SIGNALING",
+  "HALLMARK_UNFOLDED_PROTEIN_RESPONSE", "HALLMARK_PROTEIN_SECRETION",
+  "HALLMARK_APOPTOSIS", "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE", "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+  "HALLMARK_INFLAMMATORY_RESPONSE"
+)
+
+run_gsea <- function(ewas_i) {
+  pv <- ewas_i$q_bh
+  names(pv) <- ewas_i$CpG
+  set.seed(1996)
+  methylRRA(cpg.pval = pv, method = "GSEA", GS.list = hallmark,
+            GS.idtype = "ENTREZID", minsize = 30, maxsize = 300, sig.cut = 0.05)
+}
+
+gsea <- map(ewas, run_gsea)
+write.csv(bind_rows(gsea, .id = "exposure"),
+          file.path(path_out, "Fig5_hallmark_gsea.csv"), row.names = FALSE)
+```
+
+```{r}
+# Restore standard acronym capitalization after applying toTitleCase
+tidy_labels <- function(x) {
+  x <- gsub("^HALLMARK_", "", x)
+  x <- tools::toTitleCase(tolower(gsub("_", " ", x)))
+  x <- sub("^Mtorc1", "mTORC1", x)
+  x <- sub("^Pi3k Akt Mtor", "PI3K/AKT/mTOR", x)
+  x <- sub("^Tnfa", "TNFA", x)
+  x <- sub("^Dna", "DNA", x)
+  x <- sub("Nfkb$", "NFKB", x)
+  x
+}
+
+# Figure 5 encodes -log10(FDR) as wedge radius and NES as fill color
+iwalk(gsea, function(res, nm) {
+  res_circ <- res %>%
+    filter(ID %in% hall_subset) %>%
+    mutate(ID_clean = tidy_labels(ID))
+
+  p <- circ_hallmark(
+    res_circ,
+    y_var    = "neglogFDR",
+    fill_var = "NES",
+    title    = paste("Enriched Hallmark Pathways for", nm),
+    sort_by  = "padj"
+  )
+  ggsave(p, filename = file.path(path_out, sprintf("Fig5_hallmark_%s.svg", tolower(nm))),
+         width = 5, height = 5)
+})
+```
